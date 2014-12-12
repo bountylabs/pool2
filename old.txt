@@ -1,0 +1,7 @@
+PASS
+BenchmarkPool-4	  100000	     26674 ns/op
+BenchmarkRealWorkMin-4	    1000	   2523432 ns/op
+BenchmarkRealWork2Min-4	    1000	   2513797 ns/op
+BenchmarkRealWorkMax-4	    1000	   2521779 ns/op
+BenchmarkRealWork2Max-4	    1000	   2488407 ns/op
+ok  	github.com/bountylabs/pool/chan	13.997s
