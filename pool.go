@@ -4,8 +4,6 @@ package pool
 import (
 	"errors"
 	"time"
-
-	"github.com/bountylabs/pool"
 )
 
 type resourceOpen func() (interface{}, error)
@@ -55,8 +53,8 @@ type ResourcePoolStat struct {
 }
 
 type ResourcePool struct {
-	metrics pool.PoolMetrics //metrics interface to track how the pool performs
-	timeout time.Duration    //when aquiring a resource, how long should we wait before timining out
+	metrics PoolMetrics   //metrics interface to track how the pool performs
+	timeout time.Duration //when aquiring a resource, how long should we wait before timining out
 
 	reserve chan *resourceWrapper //channel of available resources
 	tickets chan *int             //channel of available tickets to create a resource
@@ -74,7 +72,7 @@ func NewPool(
 	o resourceOpen,
 	c resourceClose,
 	t resourceTest,
-	m pool.PoolMetrics,
+	m PoolMetrics,
 ) *ResourcePool {
 
 	if maxOpen < maxReserve {
@@ -269,12 +267,12 @@ func (p *ResourcePool) reportWait(d time.Duration) {
 	}
 }
 
-func (p *ResourcePool) Stats() pool.ResourcePoolStat {
+func (p *ResourcePool) Stats() ResourcePoolStat {
 
 	open := uint32(cap(p.tickets) - len(p.tickets))
 	available := uint32(len(p.reserve))
 
-	return pool.ResourcePoolStat{
+	return ResourcePoolStat{
 		AvailableNow:  available,
 		ResourcesOpen: open,
 		Cap:           uint32(cap(p.tickets)),
