@@ -3,6 +3,7 @@ package pool
 
 import (
 	"errors"
+	"runtime"
 	"time"
 )
 
@@ -53,8 +54,9 @@ type ResourcePoolStat struct {
 }
 
 type ResourcePool struct {
-	metrics PoolMetrics   //metrics interface to track how the pool performs
-	timeout time.Duration //when aquiring a resource, how long should we wait before timining out
+	metrics  PoolMetrics   //metrics interface to track how the pool performs
+	timeout  time.Duration //when aquiring a resource, how long should we wait before timining out
+	waitTime time.Duration //when aquiring a resource, how long should we wait before timining out
 
 	reserve chan *resourceWrapper //channel of available resources
 	tickets chan *int             //channel of available tickets to create a resource
@@ -87,6 +89,7 @@ func NewPool(
 		resClose: c,
 		resTest:  t,
 		timeout:  time.Second,
+		waitTime: time.Millisecond * 10,
 		metrics:  m,
 	}
 
@@ -112,26 +115,29 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (resource ResourceP
 			return nil, Timeout
 		}
 
+		//try to get or create a resource
 		r, e := p.getAvailable()
 
 		//if the test failed try again
 		if e == ResourceTestError {
-			time.Sleep(time.Microsecond)
+			time.Sleep(p.waitTime)
 			continue
 		}
 
 		//if we are at our max open try again after a short sleep
 		if e == ResourceExhaustedError {
-			time.Sleep(time.Microsecond)
+			time.Sleep(p.waitTime)
 			continue
 		}
 
 		//if we failed to create a new resource, try agaig after a short sleep
 		if e == ResourceCreationError {
-			time.Sleep(time.Microsecond)
+			time.Sleep(p.waitTime)
 			continue
 		}
 
+		//Allow other goroutines to function
+		runtime.Gosched()
 		p.reportWait(time.Now().Sub(start))
 		return r, e
 	}
