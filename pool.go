@@ -3,42 +3,33 @@ package pool
 
 import (
 	"errors"
-	"runtime"
+	"io"
 	"time"
 )
 
-type resourceOpen func() (interface{}, error)
-type resourceClose func(interface{})
-type resourceTest func(interface{}) error
+var (
+	TimeoutError    = errors.New("Timeout")
+	PoolClosedError = errors.New("Pool is closed")
+)
 
-var ResourceCreationError = errors.New("Resource Creation Failed")
-var ResourceExhaustedError = errors.New("Pool Exhausted")
-var ResourceTestError = errors.New("Resource Test Failed")
-var Timeout = errors.New("Timeout")
-var PoolClosedError = errors.New("Pool is closed")
-
-type resourceWrapper struct {
-	r interface{}
-	p *ResourcePool
-	t *int
+// ResourceOpener opens a resource
+type ResourceOpener interface {
+	Open() (Resource, error)
 }
 
-func (rw resourceWrapper) Close() {
-	rw.p.release(&rw)
+type Resource interface {
+	io.Closer
+	// Good returns true when the resource is in good state
+	Good() bool
 }
 
-func (rw resourceWrapper) Destroy() {
-	rw.p.destroy(&rw)
-}
-
-func (rw resourceWrapper) Resource() interface{} {
-	return rw.r
-}
-
-type ResourcePoolWrapper interface {
-	Close()
-	Destroy()
-	Resource() interface{}
+type PooledResource interface {
+	// Release releases the resource back to the pool for reuse
+	Release() error
+	// Destroy destroys the resource. It is no longer usable.
+	Destroy() error
+	// Resource returns the underlying Resource
+	Resource() Resource
 }
 
 type PoolMetrics interface {
@@ -53,212 +44,145 @@ type ResourcePoolStat struct {
 	InUse         uint32
 }
 
+// ResourcePool manages a pool of resources for reuse.
 type ResourcePool struct {
-	metrics  PoolMetrics   //metrics interface to track how the pool performs
-	timeout  time.Duration //when aquiring a resource, how long should we wait before timining out
-	waitTime time.Duration //when aquiring a resource, how long should we wait before timining out
+	metrics PoolMetrics //metrics interface to track how the pool performs
 
-	reserve chan *resourceWrapper //channel of available resources
-	tickets chan *int             //channel of available tickets to create a resource
+	// To get a resource, get a ticket first and then get the resource from
+	// either the reserve or open a new one.
+	// To release a resource, first put the resource back to the reserve
+	// and then put the ticket back.
+	// The order is important to make sure we never create >cap(tickets)
+	// number of resources.
+	reserve chan Resource // idle resources, ready for use
+	tickets chan struct{} // ticket to own resources
 
-	//callbacks for opening, testing and closing a resource
-	resOpen  func() (interface{}, error)
-	resClose func(interface{}) //we can't do anything with a close error
-	resTest  func(interface{}) error
+	opener ResourceOpener
+	closed chan struct{}
 }
 
-// NewPool creates a new pool of Clients.
-func NewPool(
-	maxReserve uint32,
-	maxOpen uint32,
-	o resourceOpen,
-	c resourceClose,
-	t resourceTest,
-	m PoolMetrics,
-) *ResourcePool {
-
+// New creates a new pool of Clients.
+func New(maxReserve, maxOpen uint32, opener ResourceOpener, m PoolMetrics) *ResourcePool {
 	if maxOpen < maxReserve {
 		panic("maxOpen must be > maxReserve")
 	}
-
-	//create the pool
-	p := &ResourcePool{
-		reserve:  make(chan *resourceWrapper, maxReserve),
-		tickets:  make(chan *int, maxOpen),
-		resOpen:  o,
-		resClose: c,
-		resTest:  t,
-		timeout:  time.Second,
-		waitTime: time.Millisecond * 10,
-		metrics:  m,
+	tickets := make(chan struct{}, maxOpen)
+	for i := 0; i < maxOpen; i++ {
+		tickets <- struct{}{}
 	}
-
-	//create a ticket for each possible open resource
-	for i := 0; i < int(maxOpen); i++ {
-		p.tickets <- &i
+	return &ResourcePool{
+		metrics: m,
+		reserve: make(chan Resource, maxReserve),
+		tickets: tickets,
+		opener:  opener,
+		closed:  make(chan struct{}),
 	}
-
-	return p
 }
 
-func (p *ResourcePool) Get() (resource ResourcePoolWrapper, err error) {
-	return p.GetWithTimeout(p.timeout)
+func (p *ResourcePool) Get() (PooledResource, error) {
+	return p.GetWithTimeout(365 * 24 * time.Hour) // 1 year is forever
 }
 
-func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (resource ResourcePoolWrapper, err error) {
+type pooledResource struct {
+	p   *ResourcePool
+	res Resource
+}
 
+func (pr *pooledResource) Release() error {
+	return pr.p.release(pr)
+}
+
+func (pr *pooledResource) Destroy() error {
+	return pr.p.destroy(pr)
+}
+
+func (pr *pooledResource) Resource() Resource {
+	return pr.res
+}
+
+func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, error) {
+	// order is important: first ticket then reserve
 	start := time.Now()
+	select {
+	case <-p.tickets:
+	case <-time.After(timeout):
+		return nil, TimeoutError
+	case <-p.closed:
+		return nil, PoolClosedError
+	}
+	if p.isClosed() {
+		return nil, PoolClosedError
+	}
+	p.reportMetrics(time.Now().Sub(start))
 
 	for {
-
-		if time.Now().After(start.Add(timeout)) {
-			return nil, Timeout
-		}
-
-		//try to get or create a resource
-		r, e := p.getAvailable()
-
-		//if the test failed try again
-		if e == ResourceTestError {
-			time.Sleep(p.waitTime)
-			continue
-		}
-
-		//if we are at our max open try again after a short sleep
-		if e == ResourceExhaustedError {
-			time.Sleep(p.waitTime)
-			continue
-		}
-
-		//if we failed to create a new resource, try agaig after a short sleep
-		if e == ResourceCreationError {
-			time.Sleep(p.waitTime)
-			continue
-		}
-
-		//Allow other goroutines to function
-		runtime.Gosched()
-		p.reportWait(time.Now().Sub(start))
-		return r, e
-	}
-
-}
-
-// Borrow a Resource from the pool, create one if we can
-func (p *ResourcePool) getAvailable() (*resourceWrapper, error) {
-	select {
-	case r, ok := <-p.reserve:
-
-		if ok == false {
-			return nil, PoolClosedError
-		}
-
-		//test that the re-used resource is still good
-		if err := p.resTest(r.r); err != nil {
-			return nil, ResourceTestError
-		}
-
-		return r, nil
-	default:
-	}
-
-	//nothing in reserve
-	return p.openNewResource()
-
-}
-
-func (p *ResourcePool) openNewResource() (*resourceWrapper, error) {
-
-	select {
-
-	//aquire a ticket to open a resource
-	case ticket, ok := <-p.tickets:
-
-		if ok == false {
-			return nil, PoolClosedError
-		}
-
-		obj, err := p.resOpen()
-
-		//if the open fails, return our ticket
-		if err != nil {
-
-			//if the pool is closed let the ticket go
-			select {
-			case p.tickets <- ticket:
-			default:
+		select {
+		case r := <-p.reserve:
+			if r.Good() {
+				return &pooledResource{p: p, res: r}, nil
 			}
+			r.Close()
 
-			return nil, ResourceCreationError
-		}
-
-		return &resourceWrapper{p: p, t: ticket, r: obj}, nil
-
-	//if we couldn't get a ticket we have hit our max number of resources
-	default:
-		return nil, ResourceExhaustedError
-	}
-
-}
-
-// Return returns a Resource to the pool.
-func (p *ResourcePool) release(r *resourceWrapper) {
-
-	//put the resource back in the cache
-	select {
-	case p.reserve <- r:
-	default:
-
-		//the reserve is full, close the resource and put our ticket back
-		p.resClose(r.r)
-
-		//if tickets is closed, whatever
-		select {
-		case p.tickets <- r.t:
 		default:
+			// no reserve
+			break
 		}
 	}
-}
 
-// Removes a Resource
-func (p *ResourcePool) destroy(r *resourceWrapper) {
-
-	p.resClose(r.r)
-
-	//if tickets are closed, whatever
-	select {
-	case p.tickets <- r.t:
-	default:
+	r, err := p.opener.Open()
+	if err != nil {
+		// release ticket on error
+		p.tickets <- struct{}{}
+		return nil, err
 	}
+	return &pooledResource{p: p, res: r}, nil
 }
 
-func (p *ResourcePool) Close() {
+func (p *ResourcePool) release(pr PooledResource) error {
+	var err error
+	// order is important: first reserve then ticket
+	res := pr.Resource()
+	select {
+	case p.reserve <- res:
+	default:
+		// reserve is full
+		err = res.Close()
+	}
+	p.tickets <- struct{}{}
 
+	if p.isClosed() {
+		p.drainReserve()
+	}
+	return err
+}
+
+func (p *ResourcePool) destroy(pr PooledResource) error {
+	p.tickets <- struct{}{}
+	return pr.Resource().Close()
+}
+
+// Close closes the pool. Resources in use are not affected.
+func (p *ResourcePool) Close() error {
+	close(p.closed)
 	p.drainReserve()
-	p.drainTickets()
+	return nil
 }
 
-func (p *ResourcePool) drainTickets() {
-
-	for {
-		select {
-		case _ = <-p.tickets:
-		default:
-			close(p.tickets)
-			return
-		}
+func (p *ResourcePool) isClosed() bool {
+	select {
+	case <-p.closed:
+		return true
+	default:
+		return false
 	}
 }
 
 func (p *ResourcePool) drainReserve() {
-
 	for {
 		select {
-		case resource := <-p.reserve:
-			p.resClose(resource.r)
+		case r := <-p.reserve:
+			r.Close()
 		default:
-			close(p.reserve)
-			return
 		}
 	}
 }
@@ -266,22 +190,23 @@ func (p *ResourcePool) drainReserve() {
 /**
 Metrics
 **/
-func (p *ResourcePool) reportWait(d time.Duration) {
+func (p *ResourcePool) reportMetrics(wt time.Duration) {
 	if p.metrics != nil {
-		go p.metrics.ReportWait(d)
+		go p.metrics.ReportWait(wt)
 		go p.metrics.ReportResources(p.Stats())
 	}
 }
 
 func (p *ResourcePool) Stats() ResourcePoolStat {
-
-	open := uint32(cap(p.tickets) - len(p.tickets))
+	tot := uint32(cap(p.tickets))
+	n := uint32(len(p.tickets))
+	inuse := tot - n
 	available := uint32(len(p.reserve))
 
 	return ResourcePoolStat{
 		AvailableNow:  available,
-		ResourcesOpen: open,
-		Cap:           uint32(cap(p.tickets)),
-		InUse:         open - available,
+		ResourcesOpen: inuse + available,
+		Cap:           tot,
+		InUse:         inuse,
 	}
 }
