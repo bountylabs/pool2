@@ -61,8 +61,8 @@ type ResourcePool struct {
 	closed chan struct{}
 }
 
-// New creates a new pool of Clients.
-func New(maxReserve, maxOpen uint32, opener ResourceOpener, m PoolMetrics) *ResourcePool {
+// NewPool creates a new pool of Clients.
+func NewPool(maxReserve, maxOpen uint32, opener ResourceOpener, m PoolMetrics) *ResourcePool {
 	if maxOpen < maxReserve {
 		panic("maxOpen must be > maxReserve")
 	}
@@ -115,6 +115,7 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, er
 	}
 	p.reportMetrics(time.Now().Sub(start))
 
+L:
 	for {
 		select {
 		case r := <-p.reserve:
@@ -125,7 +126,7 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, er
 
 		default:
 			// no reserve
-			break
+			break L
 		}
 	}
 
@@ -183,6 +184,7 @@ func (p *ResourcePool) drainReserve() {
 		case r := <-p.reserve:
 			r.Close()
 		default:
+			return
 		}
 	}
 }
