@@ -66,10 +66,14 @@ func New(maxReserve, maxOpen uint32, opener ResourceOpener, m PoolMetrics) *Reso
 	if maxOpen < maxReserve {
 		panic("maxOpen must be > maxReserve")
 	}
+	tickets := make(chan struct{}, maxOpen)
+	for i := 0; i < maxOpen; i++ {
+		tickets <- struct{}{}
+	}
 	return &ResourcePool{
 		metrics: m,
 		reserve: make(chan Resource, maxReserve),
-		tickets: make(chan struct{}, maxOpen),
+		tickets: tickets,
 		opener:  opener,
 		closed:  make(chan struct{}),
 	}
