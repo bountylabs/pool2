@@ -111,6 +111,8 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, er
 		return nil, PoolClosedError
 	}
 	if p.isClosed() {
+		// release ticket on close
+		p.tickets <- struct{}{}
 		return nil, PoolClosedError
 	}
 	p.reportMetrics(time.Now().Sub(start))
