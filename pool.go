@@ -101,15 +101,21 @@ func (pr *pooledResource) Resource() Resource {
 }
 
 func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, error) {
+
 	// order is important: first ticket then reserve
 	start := time.Now()
+	timer := time.NewTimer(timeout)
+
 	select {
 	case <-p.tickets:
-	case <-time.After(timeout):
+	case <-timer.C:
 		return nil, TimeoutError
 	case <-p.closed:
+		timer.Stop()
 		return nil, PoolClosedError
 	}
+
+	timer.Stop()
 	if p.isClosed() {
 		// release ticket on close
 		p.tickets <- struct{}{}
