@@ -35,6 +35,7 @@ type PooledResource interface {
 type PoolMetrics interface {
 	ReportResources(stats ResourcePoolStat)
 	ReportWait(wt time.Duration)
+	ReportBorrowTime(wt time.Duration)
 }
 
 type ResourcePoolStat struct {
@@ -84,15 +85,22 @@ func (p *ResourcePool) Get() (PooledResource, error) {
 }
 
 type pooledResource struct {
-	p   *ResourcePool
-	res Resource
+	served time.Time
+	p      *ResourcePool
+	res    Resource
 }
 
 func (pr *pooledResource) Release() error {
+	if pr.p.metrics != nil {
+		pr.p.metrics.ReportBorrowTime(time.Now().Sub(pr.served))
+	}
 	return pr.p.release(pr)
 }
 
 func (pr *pooledResource) Destroy() error {
+	if pr.p.metrics != nil {
+		pr.p.metrics.ReportBorrowTime(time.Now().Sub(pr.served))
+	}
 	return pr.p.destroy(pr)
 }
 
@@ -128,7 +136,7 @@ L:
 		select {
 		case r := <-p.reserve:
 			if r.Good() {
-				return &pooledResource{p: p, res: r}, nil
+				return &pooledResource{served: time.Now(), p: p, res: r}, nil
 			}
 			r.Close()
 
@@ -144,7 +152,7 @@ L:
 		p.tickets <- struct{}{}
 		return nil, err
 	}
-	return &pooledResource{p: p, res: r}, nil
+	return &pooledResource{served: time.Now(), p: p, res: r}, nil
 }
 
 func (p *ResourcePool) release(pr PooledResource) error {

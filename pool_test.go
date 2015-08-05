@@ -123,7 +123,9 @@ func TestBasic(t *testing.T) {
 		done := make(chan struct{}, 1)
 		go func() {
 			pr3, err := p.GetWithTimeout(5 * time.Second)
-			So(err, ShouldBeNil)
+			if err != nil {
+				t.Fatal("expected nil")
+			}
 			done <- struct{}{}
 			pr3.Destroy()
 		}()
