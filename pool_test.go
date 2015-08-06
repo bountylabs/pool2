@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,10 +22,14 @@ func (r *fakeResource) Good() bool {
 }
 
 type fakeResourceOpener struct {
-	id int32
+	id       int32
+	failOpen bool
 }
 
 func (ro *fakeResourceOpener) Open() (Resource, error) {
+	if ro.failOpen {
+		return nil, errors.New("open failed")
+	}
 	atomic.AddInt32(&ro.id, 1)
 	return &fakeResource{}, nil
 }
@@ -124,7 +129,7 @@ func TestBasic(t *testing.T) {
 		go func() {
 			pr3, err := p.GetWithTimeout(5 * time.Second)
 			if err != nil {
-				t.Fatal("expected nil")
+				t.Fatalf("GetWithTimeout failed=%v", err)
 			}
 			done <- struct{}{}
 			pr3.Destroy()
@@ -151,6 +156,21 @@ func TestBasic(t *testing.T) {
 		})
 
 		pr2.Destroy()
+		So(p.Stats(), ShouldResemble, ResourcePoolStat{
+			AvailableNow:  0,
+			ResourcesOpen: 0,
+			Cap:           2,
+			InUse:         0,
+		})
+	})
+
+	Convey("open resource failure", t, func() {
+		opener.failOpen = true
+		defer func() { opener.failOpen = false }()
+
+		pr, err := p.Get()
+		So(err, ShouldNotBeNil)
+		So(pr, ShouldBeNil)
 		So(p.Stats(), ShouldResemble, ResourcePoolStat{
 			AvailableNow:  0,
 			ResourcesOpen: 0,

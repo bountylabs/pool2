@@ -108,25 +108,38 @@ func (pr *pooledResource) Resource() Resource {
 	return pr.res
 }
 
+func (p *ResourcePool) releaseTicket() {
+	select {
+	case p.tickets <- struct{}{}:
+	default:
+		// releasing ticket should never block.
+		panic("BUG: releaseTicket is called when ticket is not issued.")
+	}
+}
+
 func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, error) {
 
 	// order is important: first ticket then reserve
 	start := time.Now()
 	timer := time.NewTimer(timeout)
+	var got bool
 
 	select {
 	case <-p.tickets:
+		got = true
 	case <-timer.C:
 		return nil, TimeoutError
 	case <-p.closed:
 		timer.Stop()
 		return nil, PoolClosedError
 	}
-
 	timer.Stop()
+	if !got {
+		panic("BUG: no ticket is got")
+	}
 	if p.isClosed() {
 		// release ticket on close
-		p.tickets <- struct{}{}
+		p.releaseTicket()
 		return nil, PoolClosedError
 	}
 	p.reportMetrics(time.Now().Sub(start))
@@ -149,7 +162,7 @@ L:
 	r, err := p.opener.Open()
 	if err != nil {
 		// release ticket on error
-		p.tickets <- struct{}{}
+		p.releaseTicket()
 		return nil, err
 	}
 	return &pooledResource{served: time.Now(), p: p, res: r}, nil
