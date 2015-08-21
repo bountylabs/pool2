@@ -122,11 +122,9 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, er
 	// order is important: first ticket then reserve
 	start := time.Now()
 	timer := time.NewTimer(timeout)
-	var got bool
 
 	select {
 	case <-p.tickets:
-		got = true
 	case <-timer.C:
 		return nil, TimeoutError
 	case <-p.closed:
@@ -134,9 +132,6 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, er
 		return nil, PoolClosedError
 	}
 	timer.Stop()
-	if !got {
-		panic("BUG: no ticket is got")
-	}
 	if p.isClosed() {
 		// release ticket on close
 		p.releaseTicket()
