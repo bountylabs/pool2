@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	TimeoutError    = errors.New("Timeout")
+	TimeoutError    = errors.New("Pool Timeout")
 	PoolClosedError = errors.New("Pool is closed")
 )
 
