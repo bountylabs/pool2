@@ -91,16 +91,14 @@ type pooledResource struct {
 }
 
 func (pr *pooledResource) Release() error {
-	if pr.p.metrics != nil {
-		pr.p.metrics.ReportBorrowTime(time.Now().Sub(pr.served))
-	}
+	defer pr.p.reportResources()
+	pr.p.reportBorrowTime(time.Now().Sub(pr.served))
 	return pr.p.release(pr)
 }
 
 func (pr *pooledResource) Destroy() error {
-	if pr.p.metrics != nil {
-		pr.p.metrics.ReportBorrowTime(time.Now().Sub(pr.served))
-	}
+	defer pr.p.reportResources()
+	pr.p.reportBorrowTime(time.Now().Sub(pr.served))
 	return pr.p.destroy(pr)
 }
 
@@ -120,6 +118,7 @@ func (p *ResourcePool) releaseTicket() {
 func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, error) {
 
 	// order is important: first ticket then reserve
+	defer p.reportResources()
 	start := time.Now()
 	timer := time.NewTimer(timeout)
 
@@ -137,7 +136,7 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, er
 		p.releaseTicket()
 		return nil, PoolClosedError
 	}
-	p.reportMetrics(time.Now().Sub(start))
+	p.reportWait(time.Now().Sub(start))
 
 L:
 	for {
@@ -216,10 +215,28 @@ func (p *ResourcePool) drainReserve() {
 /**
 Metrics
 **/
-func (p *ResourcePool) reportMetrics(wt time.Duration) {
+func (p *ResourcePool) reportWait(wt time.Duration) {
 	if p.metrics != nil {
-		go p.metrics.ReportWait(wt)
-		go p.metrics.ReportResources(p.Stats())
+		go func() {
+			p.metrics.ReportWait(wt)
+		}()
+	}
+}
+
+func (p *ResourcePool) reportBorrowTime(wt time.Duration) {
+	if p.metrics != nil {
+		go func() {
+			p.metrics.ReportBorrowTime(wt)
+		}()
+	}
+}
+
+func (p *ResourcePool) reportResources() {
+	if p.metrics != nil {
+		stats := p.Stats()
+		go func() {
+			p.metrics.ReportResources(stats)
+		}()
 	}
 }
 
