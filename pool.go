@@ -115,11 +115,14 @@ func (p *ResourcePool) releaseTicket() {
 	}
 }
 
-func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, error) {
+func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (pr PooledResource, err error) {
 
 	// order is important: first ticket then reserve
 	defer p.reportResources()
-	start := time.Now()
+	defer func(start time.Time) {
+		p.reportWait(time.Now().Sub(start))
+	}(time.Now())
+
 	timer := time.NewTimer(timeout)
 
 	select {
@@ -136,7 +139,6 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (PooledResource, er
 		p.releaseTicket()
 		return nil, PoolClosedError
 	}
-	p.reportWait(time.Now().Sub(start))
 
 L:
 	for {
