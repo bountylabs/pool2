@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"time"
+
+	"github.com/bountylabs/api_common/errutil"
 )
 
 var (
@@ -190,8 +192,7 @@ func (p *ResourcePool) destroy(pr PooledResource) error {
 // Close closes the pool. Resources in use are not affected.
 func (p *ResourcePool) Close() error {
 	close(p.closed)
-	p.drainReserve()
-	return nil
+	return p.drainReserve()
 }
 
 func (p *ResourcePool) isClosed() bool {
@@ -203,13 +204,16 @@ func (p *ResourcePool) isClosed() bool {
 	}
 }
 
-func (p *ResourcePool) drainReserve() {
+func (p *ResourcePool) drainReserve() error {
+	out := []error{}
 	for {
 		select {
 		case r := <-p.reserve:
-			r.Close()
+			if err := r.Close(); err != nil {
+				out = append(out, err)
+			}
 		default:
-			return
+			return errutil.ErrSlice(out)
 		}
 	}
 }
