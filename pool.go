@@ -117,6 +117,35 @@ func (p *ResourcePool) releaseTicket() {
 	}
 }
 
+// WarmUp allocates resources until we have approximately allocated
+// cap(p.reserve) resources.  We may under or over allocate resources (the code
+// is subject to races) if someone is getting a resource while we are warming
+// up.
+func (p *ResourcePool) WarmUp() (count int, err error) {
+
+	//loop until our open resources equals our reserve size
+	for p.NOpenResources() < cap(p.reserve) {
+
+		select {
+		case <-p.tickets:
+		case <-p.closed:
+			return count, nil
+		default: //all tickets are handed out
+			return count, nil
+		}
+
+		if pooledResource, err := p.open(); err != nil {
+			return count, err
+		} else {
+			count++
+			pooledResource.Release()
+			continue
+		}
+	}
+
+	return count, nil
+}
+
 func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (pr PooledResource, err error) {
 
 	// order is important: first ticket then reserve
@@ -142,21 +171,32 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (pr PooledResource,
 		return nil, PoolClosedError
 	}
 
-L:
+	if pooledResource := p.getFromReserve(); pooledResource != nil {
+		return pooledResource, nil
+	}
+
+	return p.open()
+
+}
+
+// getFromReserve attempts to get a pooledResource from the reserve pool, requires a ticket!
+func (p *ResourcePool) getFromReserve() *pooledResource {
 	for {
 		select {
 		case r := <-p.reserve:
 			if r.Good() {
-				return &pooledResource{served: time.Now(), p: p, res: r}, nil
+				return &pooledResource{served: time.Now(), p: p, res: r}
 			}
 			r.Close()
-
+			continue
 		default:
-			// no reserve
-			break L
+			return nil
 		}
 	}
+}
 
+// open, opens a new resource, requires a ticket!
+func (p *ResourcePool) open() (*pooledResource, error) {
 	r, err := p.opener.Open()
 	if err != nil {
 		// release ticket on error
@@ -244,6 +284,15 @@ func (p *ResourcePool) reportResources() {
 			p.metrics.ReportResources(stats)
 		}()
 	}
+}
+
+// NOpenResources returns the aproximate number of open resources. Subject to a
+// race between getting a ticket and pulling a resource from the reserve pool
+// that may result in over-estimating the number of open resources.
+func (p *ResourcePool) NOpenResources() int {
+	inuse := cap(p.tickets) - len(p.tickets)
+	available := len(p.reserve)
+	return inuse + available
 }
 
 func (p *ResourcePool) Stats() ResourcePoolStat {
