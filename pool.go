@@ -307,6 +307,8 @@ func (p *ResourcePool) GetNOpenResources() uint32 {
 	return atomic.LoadUint32(&p.nOpenResources)
 }
 
+// Stats returns an inconsistent (approximate) view of the pool's metrics. EG:
+// we may say there are more in use connections than are open.
 func (p *ResourcePool) Stats() ResourcePoolStat {
 	tot := uint32(cap(p.tickets))
 	n := uint32(len(p.tickets))
