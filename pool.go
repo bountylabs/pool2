@@ -26,6 +26,7 @@ type Resource interface {
 	Good() bool
 }
 
+// Ticket abstract type that represents the right to acquire a resource
 type Ticket struct{}
 
 type PooledResource interface {
