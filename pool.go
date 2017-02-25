@@ -4,6 +4,7 @@ package pool
 import (
 	"errors"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/bountylabs/api_common/errutil"
@@ -60,8 +61,9 @@ type ResourcePool struct {
 	reserve chan Resource // idle resources, ready for use
 	tickets chan struct{} // ticket to own resources
 
-	opener ResourceOpener
-	closed chan struct{}
+	opener         ResourceOpener
+	closed         chan struct{}
+	nOpenResources uint32
 }
 
 // NewPool creates a new pool of Clients.
@@ -124,7 +126,7 @@ func (p *ResourcePool) releaseTicket() {
 func (p *ResourcePool) WarmUp() (count int, err error) {
 
 	//loop until our open resources equals our reserve size
-	for p.NOpenResources() < cap(p.reserve) {
+	for int(p.GetNOpenResources()) < cap(p.reserve) {
 
 		select {
 		case <-p.tickets:
@@ -186,8 +188,9 @@ func (p *ResourcePool) getFromReserve() *pooledResource {
 		case r := <-p.reserve:
 			if r.Good() {
 				return &pooledResource{served: time.Now(), p: p, res: r}
+			} else {
+				p.closeResource(r)
 			}
-			r.Close()
 			continue
 		default:
 			return nil
@@ -203,7 +206,13 @@ func (p *ResourcePool) open() (*pooledResource, error) {
 		p.releaseTicket()
 		return nil, err
 	}
+	p.incrOpen()
 	return &pooledResource{served: time.Now(), p: p, res: r}, nil
+}
+
+func (p *ResourcePool) closeResource(res Resource) error {
+	p.decrOpen()
+	return res.Close()
 }
 
 func (p *ResourcePool) release(pr PooledResource) error {
@@ -214,7 +223,7 @@ func (p *ResourcePool) release(pr PooledResource) error {
 	case p.reserve <- res:
 	default:
 		// reserve is full
-		err = res.Close()
+		err = p.closeResource(res)
 	}
 	p.tickets <- struct{}{}
 
@@ -226,7 +235,7 @@ func (p *ResourcePool) release(pr PooledResource) error {
 
 func (p *ResourcePool) destroy(pr PooledResource) error {
 	p.tickets <- struct{}{}
-	return pr.Resource().Close()
+	return p.closeResource(pr.Resource())
 }
 
 // Close closes the pool. Resources in use are not affected.
@@ -249,7 +258,7 @@ func (p *ResourcePool) drainReserve() error {
 	for {
 		select {
 		case r := <-p.reserve:
-			if err := r.Close(); err != nil {
+			if err := p.closeResource(r); err != nil {
 				out = append(out, err)
 			}
 		default:
@@ -286,13 +295,16 @@ func (p *ResourcePool) reportResources() {
 	}
 }
 
-// NOpenResources returns the aproximate number of open resources. Subject to a
-// race between getting a ticket and pulling a resource from the reserve pool
-// that may result in over-estimating the number of open resources.
-func (p *ResourcePool) NOpenResources() int {
-	inuse := cap(p.tickets) - len(p.tickets)
-	available := len(p.reserve)
-	return inuse + available
+func (p *ResourcePool) incrOpen() {
+	atomic.AddUint32(&p.nOpenResources, 1)
+}
+
+func (p *ResourcePool) decrOpen() {
+	atomic.AddUint32(&p.nOpenResources, ^uint32(0))
+}
+
+func (p *ResourcePool) GetNOpenResources() uint32 {
+	return atomic.LoadUint32(&p.nOpenResources)
 }
 
 func (p *ResourcePool) Stats() ResourcePoolStat {
@@ -303,7 +315,7 @@ func (p *ResourcePool) Stats() ResourcePoolStat {
 
 	return ResourcePoolStat{
 		AvailableNow:  available,
-		ResourcesOpen: inuse + available,
+		ResourcesOpen: p.GetNOpenResources(),
 		Cap:           tot,
 		InUse:         inuse,
 	}
