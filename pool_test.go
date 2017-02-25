@@ -263,6 +263,61 @@ func TestBasic(t *testing.T) {
 	})
 }
 
+func TestWarmup(t *testing.T) {
+
+	Convey("given a pool", t, func() {
+
+		opener := fakeResourceOpener{}
+		p := NewPool(2, 4, &opener, nil)
+
+		Convey("warm the pool up", func() {
+
+			count, err := p.WarmUp()
+			So(err, ShouldBeNil)
+			So(count, ShouldEqual, 2)
+			So(p.Stats(), ShouldResemble, ResourcePoolStat{
+				AvailableNow:  2,
+				ResourcesOpen: 2,
+				Cap:           4,
+				InUse:         0,
+			})
+		})
+
+		Convey("warm the pool up after getting a connection", func() {
+
+			pr, err := p.Get()
+			So(err, ShouldBeNil)
+			So(pr, ShouldNotBeNil)
+			So(p.Stats(), ShouldResemble, ResourcePoolStat{
+				AvailableNow:  0,
+				ResourcesOpen: 1,
+				Cap:           4,
+				InUse:         1,
+			})
+
+			count, err := p.WarmUp()
+			So(err, ShouldBeNil)
+			So(count, ShouldEqual, 1)
+			So(p.Stats(), ShouldResemble, ResourcePoolStat{
+				AvailableNow:  1,
+				ResourcesOpen: 2,
+				Cap:           4,
+				InUse:         1,
+			})
+
+			pr.Release()
+			So(p.Stats(), ShouldResemble, ResourcePoolStat{
+				AvailableNow:  2,
+				ResourcesOpen: 2,
+				Cap:           4,
+				InUse:         0,
+			})
+		})
+
+	})
+
+}
+
 // TODO(binz): add a random test to exercise ResourcePool more
 // - have goroutines call Get, GetWithTimeout, and Close randomly.
 // - after all resources are released, verify the stats of all Pools ever created.

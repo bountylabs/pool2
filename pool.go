@@ -4,6 +4,7 @@ package pool
 import (
 	"errors"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/bountylabs/api_common/errutil"
@@ -24,6 +25,9 @@ type Resource interface {
 	// Good returns true when the resource is in good state
 	Good() bool
 }
+
+// Ticket abstract type that represents the right to acquire a resource
+type Ticket struct{}
 
 type PooledResource interface {
 	// Release releases the resource back to the pool for reuse
@@ -58,10 +62,11 @@ type ResourcePool struct {
 	// The order is important to make sure we never create >cap(tickets)
 	// number of resources.
 	reserve chan Resource // idle resources, ready for use
-	tickets chan struct{} // ticket to own resources
+	tickets chan *Ticket  // ticket to own resources
 
-	opener ResourceOpener
-	closed chan struct{}
+	opener         ResourceOpener
+	closed         chan struct{}
+	nOpenResources uint32
 }
 
 // NewPool creates a new pool of Clients.
@@ -69,9 +74,9 @@ func NewPool(maxReserve, maxOpen uint32, opener ResourceOpener, m PoolMetrics) *
 	if maxOpen < maxReserve {
 		panic("maxOpen must be > maxReserve")
 	}
-	tickets := make(chan struct{}, maxOpen)
+	tickets := make(chan *Ticket, maxOpen)
 	for i := uint32(0); i < maxOpen; i++ {
-		tickets <- struct{}{}
+		tickets <- &Ticket{}
 	}
 	return &ResourcePool{
 		metrics: m,
@@ -87,6 +92,7 @@ func (p *ResourcePool) Get() (PooledResource, error) {
 }
 
 type pooledResource struct {
+	ticket *Ticket
 	served time.Time
 	p      *ResourcePool
 	res    Resource
@@ -108,13 +114,46 @@ func (pr *pooledResource) Resource() Resource {
 	return pr.res
 }
 
-func (p *ResourcePool) releaseTicket() {
+func (p *ResourcePool) releaseTicket(ticket *Ticket) {
+	if ticket == nil {
+		panic("BUG: can not release a nil ticket")
+	}
 	select {
-	case p.tickets <- struct{}{}:
+	case p.tickets <- ticket:
 	default:
 		// releasing ticket should never block.
 		panic("BUG: releaseTicket is called when ticket is not issued.")
 	}
+}
+
+// WarmUp allocates resources until we have approximately allocated
+// cap(p.reserve) resources.  We may under or over allocate resources (the code
+// is subject to races) if someone is getting a resource while we are warming
+// up.
+func (p *ResourcePool) WarmUp() (count int, err error) {
+
+	//loop until our open resources equals our reserve size
+	for int(p.GetNOpenResources()) < cap(p.reserve) {
+
+		var ticket *Ticket
+		select {
+		case ticket = <-p.tickets:
+		case <-p.closed:
+			return count, nil
+		default: //all tickets are handed out
+			return count, nil
+		}
+
+		if pooledResource, err := p.open(ticket); err != nil {
+			return count, err
+		} else {
+			count++
+			pooledResource.Release()
+			continue
+		}
+	}
+
+	return count, nil
 }
 
 func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (pr PooledResource, err error) {
@@ -127,8 +166,9 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (pr PooledResource,
 
 	timer := time.NewTimer(timeout)
 
+	var ticket *Ticket
 	select {
-	case <-p.tickets:
+	case ticket = <-p.tickets:
 	case <-timer.C:
 		return nil, TimeoutError
 	case <-p.closed:
@@ -138,35 +178,63 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (pr PooledResource,
 	timer.Stop()
 	if p.isClosed() {
 		// release ticket on close
-		p.releaseTicket()
+		p.releaseTicket(ticket)
 		return nil, PoolClosedError
 	}
 
-L:
+	if pooledResource := p.getFromReserve(ticket); pooledResource != nil {
+		return pooledResource, nil
+	}
+
+	return p.open(ticket)
+
+}
+
+// getFromReserve attempts to get a pooledResource from the reserve pool, requires a ticket!
+func (p *ResourcePool) getFromReserve(ticket *Ticket) *pooledResource {
+
+	if ticket == nil {
+		panic("BUG: can not acquire a reserved resource without a ticket")
+	}
+
 	for {
 		select {
 		case r := <-p.reserve:
 			if r.Good() {
-				return &pooledResource{served: time.Now(), p: p, res: r}, nil
+				return &pooledResource{ticket: ticket, served: time.Now(), p: p, res: r}
+			} else {
+				p.closeResource(r)
 			}
-			r.Close()
-
+			continue
 		default:
-			// no reserve
-			break L
+			return nil
 		}
+	}
+}
+
+// open, opens a new resource, requires a ticket!
+func (p *ResourcePool) open(ticket *Ticket) (*pooledResource, error) {
+
+	if ticket == nil {
+		panic("BUG: can not open a resource without a ticket")
 	}
 
 	r, err := p.opener.Open()
 	if err != nil {
 		// release ticket on error
-		p.releaseTicket()
+		p.releaseTicket(ticket)
 		return nil, err
 	}
-	return &pooledResource{served: time.Now(), p: p, res: r}, nil
+	p.incrOpen()
+	return &pooledResource{ticket: ticket, served: time.Now(), p: p, res: r}, nil
 }
 
-func (p *ResourcePool) release(pr PooledResource) error {
+func (p *ResourcePool) closeResource(res Resource) error {
+	p.decrOpen()
+	return res.Close()
+}
+
+func (p *ResourcePool) release(pr *pooledResource) error {
 	var err error
 	// order is important: first reserve then ticket
 	res := pr.Resource()
@@ -174,9 +242,10 @@ func (p *ResourcePool) release(pr PooledResource) error {
 	case p.reserve <- res:
 	default:
 		// reserve is full
-		err = res.Close()
+		err = p.closeResource(res)
 	}
-	p.tickets <- struct{}{}
+	p.releaseTicket(pr.ticket)
+	pr.ticket = nil
 
 	if p.isClosed() {
 		p.drainReserve()
@@ -184,9 +253,10 @@ func (p *ResourcePool) release(pr PooledResource) error {
 	return err
 }
 
-func (p *ResourcePool) destroy(pr PooledResource) error {
-	p.tickets <- struct{}{}
-	return pr.Resource().Close()
+func (p *ResourcePool) destroy(pr *pooledResource) error {
+	p.releaseTicket(pr.ticket)
+	pr.ticket = nil
+	return p.closeResource(pr.Resource())
 }
 
 // Close closes the pool. Resources in use are not affected.
@@ -209,7 +279,7 @@ func (p *ResourcePool) drainReserve() error {
 	for {
 		select {
 		case r := <-p.reserve:
-			if err := r.Close(); err != nil {
+			if err := p.closeResource(r); err != nil {
 				out = append(out, err)
 			}
 		default:
@@ -246,6 +316,20 @@ func (p *ResourcePool) reportResources() {
 	}
 }
 
+func (p *ResourcePool) incrOpen() {
+	atomic.AddUint32(&p.nOpenResources, 1)
+}
+
+func (p *ResourcePool) decrOpen() {
+	atomic.AddUint32(&p.nOpenResources, ^uint32(0))
+}
+
+func (p *ResourcePool) GetNOpenResources() uint32 {
+	return atomic.LoadUint32(&p.nOpenResources)
+}
+
+// Stats returns an inconsistent (approximate) view of the pool's metrics. EG:
+// we may say there are more in use connections than are open.
 func (p *ResourcePool) Stats() ResourcePoolStat {
 	tot := uint32(cap(p.tickets))
 	n := uint32(len(p.tickets))
@@ -254,7 +338,7 @@ func (p *ResourcePool) Stats() ResourcePoolStat {
 
 	return ResourcePoolStat{
 		AvailableNow:  available,
-		ResourcesOpen: inuse + available,
+		ResourcesOpen: p.GetNOpenResources(),
 		Cap:           tot,
 		InUse:         inuse,
 	}
