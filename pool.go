@@ -40,8 +40,9 @@ type PooledResource interface {
 
 type PoolMetrics interface {
 	ReportResources(stats ResourcePoolStat)
-	ReportWait(wt time.Duration)
-	ReportBorrowTime(wt time.Duration)
+	ReportWait(wt time.Duration)       //how long did we wait for a connection
+	ReportBorrowTime(wt time.Duration) //how long was the connection used for
+	ReportNew(time time.Duration)      //how long did it take for a new connection to be opened
 }
 
 type ResourcePoolStat struct {
@@ -219,7 +220,10 @@ func (p *ResourcePool) open(ticket *Ticket) (*pooledResource, error) {
 		panic("BUG: can not open a resource without a ticket")
 	}
 
+	start := time.Now()
 	r, err := p.opener.Open()
+	p.reportNew(time.Now().Sub(start))
+
 	if err != nil {
 		// release ticket on error
 		p.releaseTicket(ticket)
@@ -291,28 +295,29 @@ func (p *ResourcePool) drainReserve() error {
 /**
 Metrics
 **/
+
+func (p *ResourcePool) reportNew(time time.Duration) {
+	if p.metrics != nil {
+		p.metrics.ReportNew(time)
+	}
+}
+
 func (p *ResourcePool) reportWait(wt time.Duration) {
 	if p.metrics != nil {
-		go func() {
-			p.metrics.ReportWait(wt)
-		}()
+		p.metrics.ReportWait(wt)
 	}
 }
 
 func (p *ResourcePool) reportBorrowTime(wt time.Duration) {
 	if p.metrics != nil {
-		go func() {
-			p.metrics.ReportBorrowTime(wt)
-		}()
+		p.metrics.ReportBorrowTime(wt)
 	}
 }
 
 func (p *ResourcePool) reportResources() {
 	if p.metrics != nil {
 		stats := p.Stats()
-		go func() {
-			p.metrics.ReportResources(stats)
-		}()
+		p.metrics.ReportResources(stats)
 	}
 }
 
