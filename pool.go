@@ -11,9 +11,14 @@ import (
 )
 
 var (
-	TimeoutError    = errors.New("Pool Timeout")
-	PoolClosedError = errors.New("Pool is closed")
+	TimeoutError              = errors.New("Pool Timeout")
+	PoolClosedError           = errors.New("Pool is closed")
+	NewConnectionLimitedError = errors.New("Exceeded rate limit for creating new pool connections")
 )
+
+type Limiter interface {
+	Allow() bool
+}
 
 // ResourceOpener opens a resource
 type ResourceOpener interface {
@@ -65,13 +70,14 @@ type ResourcePool struct {
 	reserve chan Resource // idle resources, ready for use
 	tickets chan *Ticket  // ticket to own resources
 
-	opener         ResourceOpener
-	closed         chan struct{}
-	nOpenResources uint32
+	opener               ResourceOpener
+	closed               chan struct{}
+	nOpenResources       uint32
+	newConnectionLimiter Limiter
 }
 
 // NewPool creates a new pool of Clients.
-func NewPool(maxReserve, maxOpen uint32, opener ResourceOpener, m PoolMetrics) *ResourcePool {
+func NewPool(maxReserve, maxOpen uint32, opener ResourceOpener, m PoolMetrics, newConnectionLimiter Limiter) *ResourcePool {
 	if maxOpen < maxReserve {
 		panic("maxOpen must be > maxReserve")
 	}
@@ -80,11 +86,12 @@ func NewPool(maxReserve, maxOpen uint32, opener ResourceOpener, m PoolMetrics) *
 		tickets <- &Ticket{}
 	}
 	return &ResourcePool{
-		metrics: m,
-		reserve: make(chan Resource, maxReserve),
-		tickets: tickets,
-		opener:  opener,
-		closed:  make(chan struct{}),
+		metrics:              m,
+		reserve:              make(chan Resource, maxReserve),
+		tickets:              tickets,
+		opener:               opener,
+		closed:               make(chan struct{}),
+		newConnectionLimiter: newConnectionLimiter,
 	}
 }
 
@@ -145,7 +152,7 @@ func (p *ResourcePool) WarmUp() (count int, err error) {
 			return count, nil
 		}
 
-		if pooledResource, err := p.open(ticket); err != nil {
+		if pooledResource, err := p.open(ticket, true); err != nil {
 			return count, err
 		} else {
 			count++
@@ -187,7 +194,7 @@ func (p *ResourcePool) GetWithTimeout(timeout time.Duration) (pr PooledResource,
 		return pooledResource, nil
 	}
 
-	return p.open(ticket)
+	return p.open(ticket, false)
 
 }
 
@@ -214,10 +221,16 @@ func (p *ResourcePool) getFromReserve(ticket *Ticket) *pooledResource {
 }
 
 // open, opens a new resource, requires a ticket!
-func (p *ResourcePool) open(ticket *Ticket) (*pooledResource, error) {
+func (p *ResourcePool) open(ticket *Ticket, fromWarmup bool) (*pooledResource, error) {
 
 	if ticket == nil {
 		panic("BUG: can not open a resource without a ticket")
+	}
+
+	if !fromWarmup && p.newConnectionLimiter != nil {
+		if !p.newConnectionLimiter.Allow() {
+			return nil, NewConnectionLimitedError
+		}
 	}
 
 	start := time.Now()
