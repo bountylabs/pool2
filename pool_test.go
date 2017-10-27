@@ -41,7 +41,7 @@ func (ro *fakeResourceOpener) ID() int {
 func TestBasic(t *testing.T) {
 	opener := fakeResourceOpener{}
 
-	p := NewPool(1, 2, &opener, nil)
+	p := NewPool(1, 2, &opener, nil, nil)
 
 	Convey("get a resource", t, func() {
 		pr, err := p.Get()
@@ -268,7 +268,7 @@ func TestWarmup(t *testing.T) {
 	Convey("given a pool", t, func() {
 
 		opener := fakeResourceOpener{}
-		p := NewPool(2, 4, &opener, nil)
+		p := NewPool(2, 4, &opener, nil, nil)
 
 		Convey("warm the pool up", func() {
 
@@ -315,7 +315,61 @@ func TestWarmup(t *testing.T) {
 		})
 
 	})
+}
 
+type MockLimiter struct {
+	allow bool
+}
+
+func (this *MockLimiter) Allow() bool {
+	return this.allow
+}
+
+func TestNewConnectLimit(t *testing.T) {
+	Convey("given a pool", t, func() {
+
+		opener := fakeResourceOpener{}
+		mockLimiter := &MockLimiter{allow: false}
+		p := NewPool(1, 2, &opener, nil, mockLimiter)
+
+		Convey("should not use limiter for warmup ", func() {
+			count, err := p.WarmUp()
+			So(err, ShouldBeNil)
+			So(count, ShouldEqual, 1)
+			So(p.Stats(), ShouldResemble, ResourcePoolStat{
+				AvailableNow:  1,
+				ResourcesOpen: 1,
+				Cap:           2,
+				InUse:         0,
+			})
+
+			Convey("should prevent creation of too many new connections", func() {
+				// Should be fine since it reuses connection created during warmup
+				pr, err := p.Get()
+				So(err, ShouldBeNil)
+
+				// Mark as bad so next call force creating a new connection
+				pr.Release()
+				pr.Resource().(*fakeResource).bad = true
+
+				mockLimiter.allow = true
+
+				// Should be fine since limiter still allows it
+				pr, err = p.Get()
+				So(err, ShouldBeNil)
+
+				mockLimiter.allow = false
+
+				// Mark as bad so next call force creating a new connection
+				pr.Release()
+				pr.Resource().(*fakeResource).bad = true
+
+				// Should error now that limiter prevents it
+				pr, err = p.Get()
+				So(err, ShouldEqual, NewConnectionLimitedError)
+			})
+		})
+	})
 }
 
 // TODO(binz): add a random test to exercise ResourcePool more
