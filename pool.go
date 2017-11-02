@@ -48,6 +48,7 @@ type PoolMetrics interface {
 	ReportWait(wt time.Duration)       //how long did we wait for a connection
 	ReportBorrowTime(wt time.Duration) //how long was the connection used for
 	ReportNew(time time.Duration)      //how long did it take for a new connection to be opened
+	ReportNewConnectionRateLimited()   // increment each time we don't create a new connection because we are rate limited
 }
 
 type ResourcePoolStat struct {
