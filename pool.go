@@ -230,7 +230,7 @@ func (p *ResourcePool) open(ticket *Ticket, fromWarmup bool) (*pooledResource, e
 
 	if !fromWarmup && p.newConnectionLimiter != nil {
 		if !p.newConnectionLimiter.Allow() {
-			p.metrics.ReportNewConnectionRateLimited()
+			p.reportNewConnectionRateLimited()
 			return nil, NewConnectionLimitedError
 		}
 	}
@@ -333,6 +333,12 @@ func (p *ResourcePool) reportResources() {
 	if p.metrics != nil {
 		stats := p.Stats()
 		p.metrics.ReportResources(stats)
+	}
+}
+
+func (p *ResourcePool) reportNewConnectionRateLimited() {
+	if p.metrics != nil {
+		p.metrics.ReportNewConnectionRateLimited()
 	}
 }
 
