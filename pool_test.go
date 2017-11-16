@@ -330,7 +330,7 @@ func TestNewConnectLimit(t *testing.T) {
 
 		opener := fakeResourceOpener{}
 		mockLimiter := &MockLimiter{allow: false}
-		p := NewPool(1, 2, &opener, nil, mockLimiter)
+		p := NewPool(1, 1, &opener, nil, mockLimiter)
 
 		Convey("should not use limiter for warmup ", func() {
 			count, err := p.WarmUp()
@@ -339,13 +339,13 @@ func TestNewConnectLimit(t *testing.T) {
 			So(p.Stats(), ShouldResemble, ResourcePoolStat{
 				AvailableNow:  1,
 				ResourcesOpen: 1,
-				Cap:           2,
+				Cap:           1,
 				InUse:         0,
 			})
 
 			Convey("should prevent creation of too many new connections", func() {
 				// Should be fine since it reuses connection created during warmup
-				pr, err := p.Get()
+				pr, err := p.GetWithTimeout(10 * time.Second)
 				So(err, ShouldBeNil)
 
 				// Mark as bad so next call force creating a new connection
@@ -355,8 +355,15 @@ func TestNewConnectLimit(t *testing.T) {
 				mockLimiter.allow = true
 
 				// Should be fine since limiter still allows it
-				pr, err = p.Get()
+				pr, err = p.GetWithTimeout(10 * time.Second)
 				So(err, ShouldBeNil)
+
+				So(p.Stats(), ShouldResemble, ResourcePoolStat{
+					AvailableNow:  0,
+					ResourcesOpen: 1,
+					Cap:           1,
+					InUse:         1,
+				})
 
 				mockLimiter.allow = false
 
@@ -365,8 +372,27 @@ func TestNewConnectLimit(t *testing.T) {
 				pr.Resource().(*fakeResource).bad = true
 
 				// Should error now that limiter prevents it
-				pr, err = p.Get()
+				pr, err = p.GetWithTimeout(10 * time.Second)
 				So(err, ShouldEqual, NewConnectionLimitedError)
+
+				So(p.Stats(), ShouldResemble, ResourcePoolStat{
+					AvailableNow:  0, // Current connection is bad, so 0 available
+					ResourcesOpen: 0, // Current connection is bad, so 0 open
+					Cap:           1,
+					InUse:         0, // When rate limited, we shouldn't say any are in use
+				})
+
+				// Once limiter allows getting a new connection, ensure it can be created
+				mockLimiter.allow = true
+				pr, err = p.GetWithTimeout(10 * time.Second)
+				So(err, ShouldBeNil)
+
+				So(p.Stats(), ShouldResemble, ResourcePoolStat{
+					AvailableNow:  0,
+					ResourcesOpen: 1,
+					Cap:           1,
+					InUse:         1,
+				})
 			})
 		})
 	})
